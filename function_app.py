@@ -159,6 +159,10 @@ def fetch_data_from_brapi(ticker: str) -> pd.DataFrame:
         logging.error(f"ERRO GENÉRICO para {ticker}: {err}")
     except Exception as e:
         logging.error(f"ERRO INESPERADO ao buscar dados para {ticker}: {e}")
+    except json.JSONDecodeError as e:
+        # Esta linha de log deve estar no Azure para nos mostrar a resposta real.
+        logging.error(f"ERRO GENÉRICO para {ticker}: {e}. Resposta da API: {response.text[:100]}...")
+        return pd.DataFrame()
         
     return pd.DataFrame()
 
