@@ -19,7 +19,7 @@ FREQUENCY_MINUTES = 30 # Usado para cálculo da MMS
 # A string de conexão é carregada das variáveis de ambiente do Azure
 CONNECTION_STRING = os.environ.get('AZURE_SQL_CONNECTION_STRING')
 # O token Brapi é carregado das variáveis de ambiente do Azure
-BRAPI_TOKEN = "o5yKDG4WEqfnLWuyAAbeUy"
+BRAPI_TOKEN = os.environ.get('BRAPI_TOKEN')
 
 
 def calculate_mms_and_alerts(df: pd.DataFrame, ticker: str, period: int) -> tuple:
@@ -112,59 +112,84 @@ def insert_alert_into_sql(alert_data: dict):
 
 
 def fetch_data_from_brapi(ticker: str) -> pd.DataFrame:
-    """Busca dados de velas do ticker na API Brapi."""
+    """Busca dados de cotação (histórico) do ticker na API Brapi usando o endpoint /api/quote."""
     
-    # Parâmetros da API
-    # 20 pontos de 30 minutos cobrem 10 horas de negociação (segurança no cálculo)
+    # Parâmetros da API (Ajustados para refletir a chamada do Colab)
+    # range=5d: 5 dias (o suficiente para 20 ou mais candles de 30m)
     interval = "30m"
-    limit = 20
+    range_days = "5d" 
     
-    # Construção da URL
-    url = f"https://brapi.dev/api/v2/finance/candles/{ticker}"
+    # Construção da URL (Usando o Endpoint de Cotação /api/quote)
+    url = f"https://brapi.dev/api/quote/{ticker}"
     
     # Parâmetros de requisição
     params = {
         'interval': interval,
-        'limit': limit,
+        'range': range_days, # Adicionado o parâmetro 'range'
         'token': BRAPI_TOKEN
     }
     
-    logging.info(f"Buscando dados para {ticker}...")
+    logging.info(f"Buscando dados para {ticker} no endpoint /api/quote...")
     
     try:
         response = requests.get(url, params=params)
         response.raise_for_status() # Lança exceção para códigos de erro (4xx ou 5xx)
+        
+        # Novo tratamento para resposta vazia/inválida
+        if not response.text:
+            logging.error(f"ERRO BRAAPI: Resposta vazia para {ticker}.")
+            return pd.DataFrame()
+        
         data = response.json()
         
-        # Verifica se os dados da API estão no formato esperado
-        if data.get('candles'):
-            df = pd.DataFrame(data['candles'])
+        # TRATAMENTO DO JSON (Baseado no seu código do Colab)
+        if 'results' in data and data['results'] and 'historicalDataPrice' in data['results'][0]:
+            dados_historico = data['results'][0]['historicalDataPrice']
+            df = pd.DataFrame(dados_historico)
             
-            # Converte timestamps para datetime
-            df['datetime'] = pd.to_datetime(df['timestamp'], unit='s')
+            # Renomeia e adiciona Ticker
+            df.rename(columns={'date': 'datetime'}, inplace=True)
+            df['Ticker'] = ticker
+            
+            # Converte timestamps
+            df['datetime'] = pd.to_datetime(df['datetime'], unit='s')
             df.set_index('datetime', inplace=True)
             
+            # Converte colunas para float (garante o cálculo correto da MMS)
+            colunas_numericas = ['open', 'high', 'low', 'close', 'volume']
+            df[colunas_numericas] = df[colunas_numericas].astype(float)
+            
+            logging.info(f"SUCESSO: {ticker} coletado ({df.shape[0]} registros).")
             return df
         else:
-            logging.error(f"ERRO BRAAPI: Dados de candles ausentes para {ticker}. Resposta: {data}")
+            logging.error(f"ERRO BRAAPI: Dados de histórico ausentes para {ticker}. Resposta: {data}")
             return pd.DataFrame()
             
     except requests.exceptions.HTTPError as errh:
         logging.error(f"ERRO HTTP para {ticker}: {errh}")
+        return pd.DataFrame() # <--- Adicionar
+    
     except requests.exceptions.ConnectionError as errc:
         logging.error(f"ERRO DE CONEXÃO para {ticker}: {errc}")
+        return pd.DataFrame() # <--- Adicionar
+    # ...
     except requests.exceptions.Timeout as errt:
         logging.error(f"ERRO DE TIMEOUT para {ticker}: {errt}")
+        return pd.DataFrame() # <--- Adicionar
+    
+    except json.JSONDecodeError as e:
+        logging.error(f"ERRO JSON para {ticker}: {e}. Conteúdo (Início): {response.text[:100] if 'response' in locals() else 'N/A'}...")
+        return pd.DataFrame() # <--- Adicionar
+
     except requests.exceptions.RequestException as err:
-        logging.error(f"ERRO GENÉRICO para {ticker}: {err}")
+        logging.error(f"ERRO GENÉRICO de Requisição para {ticker}: {err}")
+        return pd.DataFrame() # <--- Adicionar
+
     except Exception as e:
         logging.error(f"ERRO INESPERADO ao buscar dados para {ticker}: {e}")
-    except json.JSONDecodeError as e:
-        # Esta linha de log deve estar no Azure para nos mostrar a resposta real.
-        logging.error(f"ERRO GENÉRICO pagit ra {ticker}: {e}. Resposta da API: {response.text[:100]}...")
-        return pd.DataFrame()
-        
-    return pd.DataFrame()
+        return pd.DataFrame() # <--- Adicionar
+
+# Remova o return final se ele estava duplicado ou mal posicionado.
 
 
 @app.function_name(name="timer_trigger")
