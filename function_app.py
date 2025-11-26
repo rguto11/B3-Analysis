@@ -19,7 +19,7 @@ FREQUENCY_MINUTES = 30 # Usado para cálculo da MMS
 # A string de conexão é carregada das variáveis de ambiente do Azure
 CONNECTION_STRING = os.environ.get('AZURE_SQL_CONNECTION_STRING')
 # O token Brapi é carregado das variáveis de ambiente do Azure
-BRAPI_TOKEN = os.environ.get('BRAPI_TOKEN')
+BRAPI_TOKEN = "o5yKDG4WEqfnLWuyAAbeUy"
 
 
 def calculate_mms_and_alerts(df: pd.DataFrame, ticker: str, period: int) -> tuple:
