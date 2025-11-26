@@ -161,14 +161,14 @@ def fetch_data_from_brapi(ticker: str) -> pd.DataFrame:
         logging.error(f"ERRO INESPERADO ao buscar dados para {ticker}: {e}")
     except json.JSONDecodeError as e:
         # Esta linha de log deve estar no Azure para nos mostrar a resposta real.
-        logging.error(f"ERRO GENÉRICO para {ticker}: {e}. Resposta da API: {response.text[:100]}...")
+        logging.error(f"ERRO GENÉRICO pagit ra {ticker}: {e}. Resposta da API: {response.text[:100]}...")
         return pd.DataFrame()
         
     return pd.DataFrame()
 
 
-@app.timer_trigger(schedule="0 0 12 * * *", arg_name="myTimer", run_on_startup=False,
-                   use_monitor=False) 
+@app.function_name(name="timer_trigger")
+@app.schedule(schedule="0 0 12 * * *", arg_name="myTimer", run_on_startup=False) 
 def timer_trigger(myTimer: func.TimerRequest) -> None:
     """Função disparada por tempo para executar a análise de MMS e SQL."""
     
