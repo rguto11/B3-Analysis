@@ -4,7 +4,7 @@ import os
 import requests
 import json
 import pandas as pd
-import pyodbc # Reintroduzindo a biblioteca SQL
+import pyodbc
 from datetime import datetime
 import time 
 
@@ -17,6 +17,7 @@ TICKERS = ["PETR4", "VALE3", "ITUB4", "BBDC4"]
 FREQUENCY_MINUTES = 30 # Intervalo da vela para o cálculo
 SMA_PERIOD = 14 # Período da Média Móvel Simples (MMS)
 MAX_RETRIES = 3 # Número máximo de tentativas de chamada à API
+DAYS_TO_FETCH = 5 # Usa 5 dias de histórico (suficiente para velas de 30m)
 
 # --- CONEXÃO SQL E TOKEN DE API ---
 # A string de conexão é carregada das variáveis de ambiente do Azure
@@ -141,52 +142,64 @@ def insert_alert_into_sql(alert_data: dict, connection_string: str) -> bool:
             conn.close()
 
 def fetch_data_from_brapi(ticker: str, token: str) -> pd.DataFrame:
-    """Busca dados de velas do ticker na API Brapi com retentativas (backoff)."""
+    """
+    Busca dados de velas do ticker na API Brapi (usando o endpoint V1 estável) 
+    com retentativas (backoff).
+    """
     
     # Verifica o token no início
     if not token:
         logging.error("ERRO BRAAPI: Token de acesso não fornecido ou vazio.")
         return pd.DataFrame()
 
-    interval = "30m"
-    limit = 20 # 20 velas para o cálculo da MMS de 14 períodos
-    url = f"https://brapi.dev/api/v2/finance/candles/{ticker}"
+    # MUDANÇA CRÍTICA: Revertendo para o endpoint V1 (/api/quote)
+    url = f"https://brapi.dev/api/quote/{ticker}" 
     
     params = {
-        'interval': interval,
-        'limit': limit,
-        'token': token
+        'interval': "30m",
+        'days': DAYS_TO_FETCH, # Usado no V1 para profundidade histórica
+        'token': token,
+        'fields': 'historicalData' # CRÍTICO para obter a série histórica no V1
     }
     
-    response = None # Inicializa response para uso em blocos except
+    response = None
     
     for attempt in range(MAX_RETRIES):
-        logging.info(f"Buscando dados em tempo real para {ticker} (Tentativa {attempt + 1}/{MAX_RETRIES})...")
+        logging.info(f"Buscando dados em tempo real (V1) para {ticker} (Tentativa {attempt + 1}/{MAX_RETRIES})...")
         
         try:
             response = requests.get(url, params=params, timeout=15)
             
-            # 1. Log do Status HTTP da resposta
+            # Log do Status HTTP da resposta
             status_code = response.status_code if response is not None else 'N/A'
             logging.info(f"Resposta HTTP para {ticker}: Status {status_code}")
             
             response.raise_for_status() 
             
-            # 2. Tenta decodificar o JSON
+            # Tenta decodificar o JSON
             data = response.json()
             
-            if data.get('candles'):
-                df = pd.DataFrame(data['candles'])
-                df['datetime'] = pd.to_datetime(df['timestamp'], unit='s')
-                df.set_index('datetime', inplace=True)
-                logging.info(f"SUCESSO BRAAPI: {len(df)} velas carregadas para {ticker}.")
-                return df # Sucesso: retorna e sai da função
+            # V1 Response: Acha o resultado do ticker e extrai 'historicalData'
+            if data.get('results'):
+                result = data['results'][0] # O resultado está na primeira (e única) posição
+                historical_data = result.get('historicalData')
+                
+                if historical_data:
+                    df = pd.DataFrame(historical_data)
+                    df['datetime'] = pd.to_datetime(df['date'], unit='s') # V1 usa 'date' (timestamp)
+                    df.set_index('datetime', inplace=True)
+                    # O nome da coluna no V1 já é 'close' (minúsculo), que é o que o calculate_mms_and_alerts espera.
+                    logging.info(f"SUCESSO BRAAPI (V1): {len(df)} velas carregadas para {ticker}.")
+                    return df
+                else:
+                    logging.warning(f"AVISO BRAAPI: Dados 'historicalData' ausentes para {ticker}. Resposta da API: {data}")
+                    return pd.DataFrame()
             else:
-                logging.warning(f"AVISO BRAAPI: Dados de candles ausentes para {ticker}. Resposta da API: {data}")
-                return pd.DataFrame() # Falha de dados: retorna e sai da função
+                 logging.warning(f"AVISO BRAAPI: Array 'results' ausente ou vazio para {ticker}. Resposta: {data}")
+                 return pd.DataFrame()
                 
         except json.JSONDecodeError as e:
-            # 3. Tratamento e Log Aprimorado para erro de JSON (que ocorre quando é HTML/Texto)
+            # Tratamento para erro de JSON (ocorre se for 404/403 com resposta HTML/Texto)
             error_response_text = response.text[:300].replace('\n', ' ') if response is not None else "Sem resposta"
             
             if response is not None and (not response.text or response.text.strip().startswith('<!DOCTYPE html>')):
@@ -195,19 +208,18 @@ def fetch_data_from_brapi(ticker: str, token: str) -> pd.DataFrame:
                 logging.error(f"ERRO JSON DECODIFICAÇÃO para {ticker}: {e}. Conteúdo (Início): {error_response_text}...")
                 
         except requests.exceptions.HTTPError as errh:
-            # 4. Captura erros 4xx/5xx (e.g., 401 Unauthorized, 429 Too Many Requests)
+            # Captura erros 4xx/5xx (incluindo 404, 401, 429)
             status_code = response.status_code if response is not None else 'N/A'
             logging.error(f"ERRO HTTP (Tentativa {attempt+1}/{MAX_RETRIES}) para {ticker}: Código {status_code} - {errh}")
             
         except requests.exceptions.RequestException as err:
-            # 5. Captura erros de conexão, timeout, DNS, etc.
+            # Captura erros de conexão, timeout, DNS, etc.
             logging.error(f"ERRO DE REQUISIÇÃO GENÉRICO (Tentativa {attempt+1}/{MAX_RETRIES}) para {ticker}: {err}")
         except Exception as e:
             logging.error(f"ERRO INESPERADO (Tentativa {attempt+1}/{MAX_RETRIES}) ao buscar dados para {ticker}: {e}")
         
         # Se falhou, mas não foi a última tentativa, espera e tenta novamente (Exponential Backoff)
         if attempt < MAX_RETRIES - 1:
-            # Espera 1s, 2s, 4s...
             wait_time = 2 ** attempt 
             logging.info(f"Falha na tentativa {attempt + 1}. Tentando novamente em {wait_time} segundos...")
             time.sleep(wait_time)
