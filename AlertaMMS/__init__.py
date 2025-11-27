@@ -9,7 +9,7 @@ import azure.functions as func
 def main(mytimer: func.TimerRequest) -> None:
     """
     Função Time Trigger para coletar dados da Brapi, calcular MMS (20),
-    verificar o cruzamento e registrar a análise no log do Azure.
+    verificar o cruzamento e registrar a análise no log do Azure e no SQL DB.
     """
     # --------------------------------------------------------------------------
     # 1. Configurações e Variáveis de Ambiente
@@ -34,109 +34,160 @@ def main(mytimer: func.TimerRequest) -> None:
     todos_os_dataframes = []
 
     # --------------------------------------------------------------------------
-    # 2. Coleta Múltipla com Brapi
+    # 2. Coleta Múltipla de Dados (Uma requisição para todos os tickers)
     # --------------------------------------------------------------------------
+
+    # Converte TICKERS para uma string separada por vírgulas para a API
+    tickers_str = ",".join(TICKERS)
     
-    for TICKER in TICKERS:
-        URL_BASE = f'https://brapi.dev/api/quote/{TICKER}?range={DIAS}d&interval={INTERVALO}&token={TOKEN_BRAPI}'
-        df_temp = pd.DataFrame()
+    # URL da API da Brapi
+    url_brapi = f"https://brapi.dev/api/quote/{tickers_str}"
+    
+    # Parâmetros para buscar o histórico
+    params = {
+        'interval': INTERVALO,
+        'days': DIAS,
+        'token': TOKEN_BRAPI,
+        'output': 'json',
+        'fields': 'historicalData'
+    }
 
-        try:
-            resposta = requests.get(URL_BASE)
-            resposta.raise_for_status()
-            dados_json = resposta.json()
-
-            if 'results' in dados_json and dados_json['results']:
-                dados_historico = dados_json['results'][0]['historicalDataPrice']
-                df_temp = pd.DataFrame(dados_historico)
-
-                # Processamento do DataFrame
-                df_temp.rename(columns={'date': 'datetime'}, inplace=True)
-                df_temp['Ticker'] = TICKER
-                df_temp['datetime'] = pd.to_datetime(df_temp['datetime'], unit='s')
-                df_temp.set_index('datetime', inplace=True)
+    try:
+        response = requests.get(url_brapi, params=params, timeout=30)
+        response.raise_for_status() # Lança exceção para códigos de status HTTP de erro
+        dados_json = response.json()
+        
+        for resultado in dados_json.get('results', []):
+            ticker = resultado.get('symbol')
+            historical_data = resultado.get('historicalData', [])
+            
+            if historical_data:
+                # Cria o DataFrame
+                df = pd.DataFrame(historical_data)
                 
-                colunas_numericas = ['open', 'high', 'low', 'close', 'volume']
-                df_temp[colunas_numericas] = df_temp[colunas_numericas].astype(float)
+                # Converte o timestamp para datetime (UTC e depois para SP)
+                df['datetime'] = pd.to_datetime(df['date'], unit='s', utc=True).dt.tz_convert('America/Sao_Paulo')
                 
-                todos_os_dataframes.append(df_temp)
-                logging.info(f"Sucesso: {TICKER} coletado ({df_temp.shape[0]} registros).")
-
+                # Remove colunas desnecessárias, renomeia e ajusta tipos
+                df = df[['datetime', 'open', 'close', 'high', 'low', 'volume']]
+                df.columns = ['datetime', 'Open', 'Close', 'High', 'Low', 'Volume']
+                df['Ticker'] = ticker # Adiciona a coluna Ticker
+                
+                # Garante que 'Close' é float para o cálculo da MMS
+                df['Close'] = df['Close'].astype(float)
+                
+                # Adiciona o DF processado à lista
+                todos_os_dataframes.append(df)
+                
+                logging.info(f"SUCESSO: Dados de {ticker} coletados ({len(df)} registros).")
             else:
-                logging.warning(f"Falha: Não há resultados para o ticker {TICKER}.")
+                logging.warning(f"AVISO: Nenhuma 'historicalData' encontrada para {ticker}.")
 
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Erro de Requisição para {TICKER}: {e}")
-
-    df_master = pd.concat(todos_os_dataframes) if todos_os_dataframes else pd.DataFrame()
-
-    if df_master.empty:
-        logging.error("ERRO: df_master Vazio. Coleta não gerou dados. Interrompendo.")
+    except requests.exceptions.Timeout:
+        logging.error("ERRO: O tempo limite da requisição HTTP para a Brapi foi atingido.")
+        return
+    except requests.exceptions.RequestException as e:
+        logging.error(f"ERRO HTTP: Falha na requisição para a Brapi: {e}")
+        return
+    except Exception as e:
+        logging.error(f"ERRO GERAL na coleta de dados: {e}")
         return
 
-    logging.info(f"Coleta Múltipla Concluída. Total de Registros: {df_master.shape[0]}.")
-
     # --------------------------------------------------------------------------
-    # 3. Processamento, Cálculo da MMS e Alerta
+    # 3. Análise, Geração de Alertas e Extração Inicial de Preços
     # --------------------------------------------------------------------------
-    
-    # Cálculo da MMS (adaptado para MultiIndex)
-    mms_series = df_master.groupby('Ticker')['close'].rolling(window=PERIODO_MMS).mean()
-    mms_series.name = 'MMS'
-    df_mms = mms_series.reset_index(level=['Ticker', 'datetime'])
-    
-    df_master_reset = df_master.reset_index()
-    df_master = df_master_reset.merge(
-        df_mms[['Ticker', 'datetime', 'MMS']],
-        on=['Ticker', 'datetime'],
-        how='left'
-    ).set_index('datetime')
-    
-    logging.info("ANÁLISE DE ALERTA INTELIGENTE (Cruzamento MMS) iniciada.")
 
-    # 4. Iterar e Enviar Alerta/Inserir no SQL
-    
     registros_para_sql = []
+    primeiros_precos = [] # Lista para armazenar o preço e MMS mais recentes de cada ativo
     
-    for ticker in df_master['Ticker'].unique():
-        df_ticker = df_master[df_master['Ticker'] == ticker].dropna(subset=['MMS'])
+    for df in todos_os_dataframes:
+        if df.empty:
+            continue
+        
+        ticker = df.iloc[0]['Ticker']
+        
+        # 3.1. Cálculo da Média Móvel Simples (MMS)
+        df['MMS_Valor'] = df['Close'].rolling(window=PERIODO_MMS).mean()
+        
+        # Remove as linhas iniciais com valor NaN no MMS
+        df.dropna(subset=['MMS_Valor'], inplace=True)
 
-        if df_ticker.shape[0] < 2:
-            logging.warning(f"[AVISO] {ticker}: Dados insuficientes ({df_ticker.shape[0]} para MMS).")
+        # ----------------------------------------------------------------------
+        # EXTRAÇÃO DOS 2 PREÇOS MAIS RECENTES (Último Preço e Última MMS)
+        # ----------------------------------------------------------------------
+        if not df.empty:
+            ultima_linha = df.iloc[-1]
+            preco_fechamento_atual = ultima_linha['Close']
+            mms_valor_atual = ultima_linha['MMS_Valor']
+            
+            primeiros_precos.append((
+                ticker, 
+                f"R${preco_fechamento_atual:.2f}", 
+                f"R${mms_valor_atual:.2f}"
+            ))
+        else:
+            # Pula para o próximo ticker se o DF ficou vazio após o dropna
+            logging.warning(f"AVISO: {ticker} possui dados insuficientes após o cálculo da MMS.")
             continue
 
-        registro_recente = df_ticker.iloc[-1]
-        registro_anterior = df_ticker.iloc[-2]
 
-        preco_atual = registro_recente['close']
-        mms_atual = registro_recente['MMS']
-        preco_anterior = registro_anterior['close']
-        mms_anterior = registro_anterior['MMS']
+        # 3.2. Verificação de Cruzamento (Alerta)
         
-        alerta_acao = "Nenhum"
-        
-        if preco_atual > mms_atual and preco_anterior <= mms_anterior:
-            alerta_acao = "COMPRA"
-            logging.info(f"!!! ALERTA {ticker}: Preço ({preco_atual:.2f}) CRUZOU MMS ({mms_atual:.2f}) de baixo para cima (COMPRA).")
-        elif preco_atual < mms_atual and preco_anterior >= mms_anterior:
-            alerta_acao = "VENDA"
-            logging.info(f"!!! ALERTA {ticker}: Preço ({preco_atual:.2f}) CRUZOU MMS ({mms_atual:.2f}) de cima para baixo (VENDA).")
-        else:
-            logging.info(f"--- {ticker}: Sem cruzamento recente. Tendência mantida. ---")
+        # Necessita de pelo menos 2 pontos para verificar o cruzamento
+        if len(df) < 2:
+            logging.warning(f"AVISO: {ticker} possui dados insuficientes após o cálculo da MMS para verificar o cruzamento.")
+            continue
 
-        # Preparar registro para o SQL
-        if alerta_acao != "Nenhum":
-            registros_para_sql.append((
-                registro_recente.name, # datetime
-                ticker,
-                preco_atual,
-                mms_atual,
-                alerta_acao,
-                'MMS-20'
-            ))
+        # Cria colunas para o ponto anterior
+        df['Close_Anterior'] = df['Close'].shift(1)
+        df['MMS_Anterior'] = df['MMS_Valor'].shift(1)
+        
+        # Ação padrão: Aguardar (inclui NaN na primeira linha)
+        df['Alerta_Acao'] = 'Aguardar'
+        
+        # Verifica o sinal de cruzamento de compra (Preço anterior abaixo da MMS, Preço atual acima ou igual)
+        condicao_compra = (df['Close_Anterior'] < df['MMS_Anterior']) & (df['Close'] >= df['MMS_Valor'])
+        df.loc[condicao_compra, 'Alerta_Acao'] = 'COMPRAR'
+
+        # Verifica o sinal de cruzamento de venda (Preço anterior acima da MMS, Preço atual abaixo)
+        condicao_venda = (df['Close_Anterior'] >= df['MMS_Anterior']) & (df['Close'] < df['MMS_Valor'])
+        df.loc[condicao_venda, 'Alerta_Acao'] = 'VENDER'
+
+        # 3.3. Preparação dos Registros
+        # Filtra apenas os registros que geraram alerta (COMPRAR ou VENDER)
+        df_alertas = df[df['Alerta_Acao'].isin(['COMPRAR', 'VENDER'])].copy()
+        
+        if not df_alertas.empty:
+            logging.info(f"ALERTA(S) GERADO(S) para {ticker}: {df_alertas['Alerta_Acao'].tolist()}")
+            
+            # Formata os registros para a inserção no SQL
+            registros = df_alertas.apply(
+                lambda row: (
+                    row['datetime'].strftime('%Y-%m-%d %H:%M:%S'), # Formata o datetime para SQL
+                    ticker,
+                    row['Close'],
+                    row['MMS_Valor'],
+                    row['Alerta_Acao'],
+                    'Cruzamento MMS'
+                ),
+                axis=1
+            ).tolist()
+            registros_para_sql.extend(registros)
 
     # --------------------------------------------------------------------------
-    # 5. Inserção no Banco de Dados SQL do Azure
+    # 4. Sumário dos Preços Iniciais (Os 2 Preços - Logado no Azure)
+    # --------------------------------------------------------------------------
+    if primeiros_precos:
+        log_msg = ["ÚLTIMOS PREÇOS E MMS (2 Preços por Ticker) antes de abastecer a base:"]
+        for ticker, preco, mms in primeiros_precos:
+            log_msg.append(f"  - {ticker}: Preço = {preco}, MMS({PERIODO_MMS}) = {mms}")
+        
+        logging.info("\n".join(log_msg))
+    else:
+        logging.warning("AVISO: Nenhum preço inicial de fechamento/MMS foi extraído.")
+        
+    # --------------------------------------------------------------------------
+    # 5. Persistência dos Dados (Abastecendo a Base SQL)
     # --------------------------------------------------------------------------
     
     if registros_para_sql and SQL_CONNECTION_STRING:
@@ -169,6 +220,9 @@ def main(mytimer: func.TimerRequest) -> None:
                 logging.info("Conexão SQL fechada.")
     
     elif not SQL_CONNECTION_STRING:
-        logging.warning("AVISO: String de Conexão SQL não configurada. Alertas não serão salvos no banco de dados.")
+        logging.warning("AVISO: String de Conexão SQL não fornecida. Alertas não foram persistidos no Banco de Dados.")
+    
+    else:
+        logging.info("INFO: Nenhum alerta de COMPRA/VENDA gerado para inserção no SQL.")
 
-    logging.info("Execução da Função Azure concluída.")
+    logging.info("Execução da Análise de Cruzamento de MMS concluída.")
