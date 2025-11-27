@@ -141,7 +141,7 @@ def insert_alert_into_sql(alert_data: dict, connection_string: str) -> bool:
             conn.close()
 
 def fetch_data_from_brapi(ticker: str, token: str) -> pd.DataFrame:
-    """Busca dados de velas do ticker na API Brapi (V2) com retentativas."""
+    """Busca dados de velas do ticker na API Brapi (V2) com retentativas e tratamento de erro HTML."""
     
     if not token:
         logging.error("ERRO BRAAPI: Token de acesso não fornecido ou vazio.")
@@ -179,7 +179,6 @@ def fetch_data_from_brapi(ticker: str, token: str) -> pd.DataFrame:
                 elif status_code == 429:
                     logging.error(f"ERRO CRÍTICO 429 (Limite de Taxa Excedido). Causa: O token gratuito está no Rate Limit. Tente novamente em 1 hora.")
                 
-                # Se for um erro crítico, pulamos o raise_for_status() e forçamos o retry (se for o caso)
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(2 ** attempt)
                     continue # Vai para a próxima tentativa
@@ -188,6 +187,29 @@ def fetch_data_from_brapi(ticker: str, token: str) -> pd.DataFrame:
             
             # Se não for um erro crítico conhecido, forçamos o raise para capturar outros 4xx/5xx
             response.raise_for_status() 
+
+            # ---------------------------------------------------------------------
+            # NOVO: TRATAMENTO PARA RESPOSTA HTML COM STATUS 200 (CAUSA DO SEU ERRO)
+            # ---------------------------------------------------------------------
+            content_type = response.headers.get('Content-Type', '').lower()
+            
+            # Verifica se o Status é 200 (OK), mas o conteúdo é HTML (página de aviso/limite)
+            if 'application/json' not in content_type and response.text.strip().startswith('<!DOCTYPE html>'):
+                error_response_text = response.text[:300].replace('\n', ' ')
+                logging.error(f"ERRO DE CONTEÚDO para {ticker}: Status 200, mas **HTML recebido** (Não JSON). Causa provável: **Token inválido ou Rate Limit**. Conteúdo (Início): {error_response_text}...")
+                
+                # Força a falha da tentativa para que a lógica de retry seja acionada
+                if attempt < MAX_RETRIES - 1:
+                    wait_time = 2 ** attempt
+                    logging.info(f"Falha na tentativa {attempt + 1}. Tentando novamente em {wait_time} segundos...")
+                    time.sleep(wait_time)
+                    continue 
+                else:
+                    # Se for a última tentativa, o json.JSONDecodeError ocorrerá abaixo, mas o log
+                    # do erro real já foi feito acima.
+                    pass
+
+            # ---------------------------------------------------------------------
             
             # Tenta decodificar o JSON
             data = response.json()
@@ -203,8 +225,9 @@ def fetch_data_from_brapi(ticker: str, token: str) -> pd.DataFrame:
                 return pd.DataFrame()
                 
         except json.JSONDecodeError as e:
+            # Este bloco agora pega o erro caso o HTML (ou outro conteúdo não-JSON) não tenha sido pego acima
             error_response_text = response.text[:300].replace('\n', ' ') if response is not None else "Sem resposta"
-            logging.error(f"ERRO JSON DECODIFICAÇÃO para {ticker}: Ocorreu um erro ao ler a resposta da API. {e}. Conteúdo (Início): {error_response_text}...")
+            logging.error(f"ERRO JSON DECODIFICAÇÃO para {ticker}: Falha ao decodificar a resposta. {e}. Conteúdo (Início): {error_response_text}...")
                 
         except requests.exceptions.HTTPError as errh:
             status_code = response.status_code if response is not None else 'N/A'
@@ -229,7 +252,7 @@ def fetch_data_from_brapi(ticker: str, token: str) -> pd.DataFrame:
 
 @app.function_name(name="timer_trigger")
 # CRON alterado para rodar a cada 5 minutos para facilitar o debugging
-@app.schedule(schedule="0 */5 * * * *", arg_name="myTimer", run_on_startup=False) 
+@app.schedule(schedule="0 0 * * * *", arg_name="myTimer", run_on_startup=False) 
 def timer_trigger(myTimer: func.TimerRequest) -> None:
     """Função disparada por tempo para executar a análise de MMS e SQL."""
     
