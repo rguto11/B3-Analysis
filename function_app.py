@@ -1,226 +1,221 @@
 import logging
-import azure.functions as func
 import os
 import requests
-import json
-import pandas as pd
 import pyodbc
-from datetime import datetime
-import time # Importamos 'time' para usar em um mecanismo de backoff simples
+import pandas as pd
+import datetime
+import azure.functions as func
 
-# Inicialização da Function App
-app = func.FunctionApp()
-
-# --- VARIÁVEIS DE CONFIGURAÇÃO ---
-# Lista de tickers para análise
-TICKERS = ["PETR4", "VALE3", "ITUB4", "BBDC4"] 
-FREQUENCY_MINUTES = 30 # Intervalo da vela para o cálculo
-SMA_PERIOD = 14 # Período da Média Móvel Simples (MMS)
-
-# --- CONEXÃO SQL E TOKEN DE API ---
-# A string de conexão é carregada das variáveis de ambiente do Azure
-CONNECTION_STRING = os.environ.get('AZURE_SQL_CONNECTION_STRING')
-# O token Brapi deve ser configurado nas variáveis de ambiente
-BRAPI_TOKEN = os.environ.get("BRAPI_TOKEN")
-
-
-def calculate_mms_and_alerts(df: pd.DataFrame, ticker: str, period: int) -> tuple:
+def main(mytimer: func.TimerRequest) -> None:
     """
-    Calcula a Média Móvel Simples (MMS) e gera um alerta se o preço atual
-    cruzar a MMS.
+    Função Time Trigger para coletar dados da Brapi, calcular MMS (20),
+    verificar o cruzamento e registrar a análise no log do Azure e no SQL DB.
     """
-
-    # 1. Tratamento de dados: Garantir que 'close' é numérico
-    df['close'] = pd.to_numeric(df['close'], errors='coerce')
+    # --------------------------------------------------------------------------
+    # 1. Configurações e Variáveis de Ambiente
+    # --------------------------------------------------------------------------
     
-    # Garantir que há dados suficientes
-    if len(df) < period:
-        logging.warning(f"AVISO: Dados insuficientes para {ticker}. Requer {period} pontos, mas encontrou {len(df)}.")
-        return None, None
-
-    # 2. Cálculo da MMS
-    df['MMS'] = df['close'].rolling(window=period).mean()
-
-    # 3. Extração dos pontos atuais
-    last_row = df.iloc[-1]
+    # Obtém as variáveis de ambiente que você configurou no Azure Portal
+    TOKEN_BRAPI = os.environ.get('BRAPI_TOKEN')
+    SQL_CONNECTION_STRING = os.environ.get('AZURE_SQL_CONNECTION_STRING')
     
-    current_price = last_row['close'] 
-    last_mms = last_row['MMS'] 
+    # Configurações do projeto
+    TICKERS = ['PETR4', 'MGLU3', 'VALE3', 'ITUB4']
+    INTERVALO = '30m'
+    DIAS = 5
+    PERIODO_MMS = 20
     
-    # 4. Verificação de Alerta (Cruzamento)
-    # Precisamos de pelo menos o período + 1 ponto para ver um cruzamento completo
-    if len(df) >= period + 1:
-        prev_row = df.iloc[-2]
-        prev_price = prev_row['close']
-        prev_mms = prev_row['MMS']
+    if not TOKEN_BRAPI:
+        logging.error("O token da Brapi não foi encontrado nas Variáveis de Ambiente. A execução será interrompida.")
+        return
         
-        alert_type = None
-        
-        # CRUZAMENTO DE COMPRA (Preço sobe e cruza MMS de baixo para cima)
-        if prev_price < prev_mms and current_price > last_mms:
-            alert_type = "COMPRA"
-        
-        # CRUZAMENTO DE VENDA (Preço cai e cruza MMS de cima para baixo)
-        elif prev_price > prev_mms and current_price < last_mms:
-            alert_type = "VENDA"
-        
-        if alert_type:
-            # Garante que os valores numéricos são floats padrão do Python para serialização/SQL
-            return alert_type, {
-                "ticker": ticker,
-                "price": float(current_price),
-                "mms": float(last_mms),
-                "timestamp": datetime.now().isoformat(),
-                "alert_type": alert_type
-            }
+    logging.info(f"Iniciando coleta de {len(TICKERS)} ativos na frequência de {INTERVALO}...")
 
-    return None, None
+    todos_os_dataframes = []
 
+    # --------------------------------------------------------------------------
+    # 2. Coleta Múltipla de Dados
+    # --------------------------------------------------------------------------
 
-def insert_alert_into_sql(alert_data: dict, connection_str: str):
-    """Insere o alerta gerado no Banco de Dados SQL do Azure usando backoff em caso de falha."""
+    # Converte TICKERS para uma string separada por vírgulas para a API
+    tickers_str = ",".join(TICKERS)
     
-    insert_query = """
-    INSERT INTO Alerts (Ticker, Price, MMS, AlertType, Timestamp)
-    VALUES (?, ?, ?, ?, ?);
-    """
+    # URL da API da Brapi (ajuste se necessário, mas este endpoint é comum para histórico)
+    url_brapi = f"https://brapi.dev/api/quote/{tickers_str}"
     
-    # Implementação de backoff simples para tentar novamente em falhas temporárias de rede/SQL
-    max_retries = 3
-    
-    for attempt in range(max_retries):
-        conn = None
-        try:
-            conn = pyodbc.connect(connection_str)
-            cursor = conn.cursor()
-            
-            cursor.execute(insert_query, 
-                           alert_data['ticker'], 
-                           alert_data['price'], 
-                           alert_data['mms'], 
-                           alert_data['alert_type'], 
-                           alert_data['timestamp'])
-            
-            conn.commit()
-            logging.info(f"SUCESSO SQL: Alerta {alert_data['alert_type']} para {alert_data['ticker']} inserido.")
-            return True # Sucesso
-            
-        except pyodbc.Error as e:
-            logging.error(f"ERRO SQL ({alert_data['ticker']}, tentativa {attempt + 1}): {e}")
-            if attempt < max_retries - 1:
-                wait_time = 2 ** attempt
-                logging.info(f"Tentando novamente em {wait_time} segundos...")
-                time.sleep(wait_time)
-            else:
-                logging.error(f"FALHA SQL PERMANENTE: Não foi possível inserir o alerta após {max_retries} tentativas.")
-                return False
-                
-        except Exception as e:
-            logging.error(f"ERRO INESPERADO ao inserir alerta para {alert_data['ticker']}: {e}")
-            return False
-            
-        finally:
-            if conn:
-                conn.close()
-    return False
-
-
-def fetch_data_from_brapi(ticker: str, token: str) -> pd.DataFrame:
-    """Busca dados de velas do ticker na API Brapi."""
-    
-    if not token:
-        logging.error("ERRO: BRAPI_TOKEN não está configurado. Não é possível buscar dados.")
-        return pd.DataFrame()
-
-    # Intervalo e limite da API (20 pontos de 30 minutos = 10 horas de dados)
-    interval = "30m"
-    limit = 20
-    
-    url = f"https://brapi.dev/api/v2/finance/candles/{ticker}"
-    
+    # Parâmetros para buscar o histórico
     params = {
-        'interval': interval,
-        'limit': limit,
-        'token': token
+        'interval': INTERVALO,
+        'days': DIAS,
+        'range': '1y', # '1y' como padrão de segurança, mas 'days' limita o retorno
+        'token': TOKEN_BRAPI,
+        'output': 'json',
+        'fields': 'historicalData'
     }
-    
-    logging.info(f"Buscando dados para {ticker}...")
-    
+
     try:
-        response = requests.get(url, params=params, timeout=15) # Adicionei um timeout
-        response.raise_for_status() 
-        data = response.json()
+        response = requests.get(url_brapi, params=params, timeout=30)
+        response.raise_for_status() # Lança exceção para códigos de status HTTP de erro
+        dados_json = response.json()
         
-        if data.get('candles'):
-            df = pd.DataFrame(data['candles'])
+        for resultado in dados_json.get('results', []):
+            ticker = resultado.get('symbol')
+            historical_data = resultado.get('historicalData', [])
             
-            # Converte timestamps (segundos) para datetime
-            df['datetime'] = pd.to_datetime(df['timestamp'], unit='s')
-            df.set_index('datetime', inplace=True)
-            
-            return df
-        else:
-            logging.warning(f"AVISO BRAAPI: Dados de candles ausentes para {ticker}. Resposta: {data}")
-            return pd.DataFrame()
-            
+            if historical_data:
+                # Cria o DataFrame
+                df = pd.DataFrame(historical_data)
+                
+                # Converte o timestamp para datetime
+                df['datetime'] = pd.to_datetime(df['date'], unit='s', utc=True).dt.tz_convert('America/Sao_Paulo')
+                
+                # Remove colunas desnecessárias e renomeia
+                df = df[['datetime', 'open', 'close', 'high', 'low', 'volume']]
+                df.columns = ['datetime', 'Open', 'Close', 'High', 'Low', 'Volume']
+                df['Ticker'] = ticker # Adiciona a coluna Ticker
+                
+                # Adiciona o DF processado à lista
+                todos_os_dataframes.append(df)
+                
+                logging.info(f"SUCESSO: Dados de {ticker} coletados ({len(df)} registros).")
+            else:
+                logging.warning(f"AVISO: Nenhuma 'historicalData' encontrada para {ticker}.")
+
+    except requests.exceptions.Timeout:
+        logging.error("ERRO: O tempo limite da requisição HTTP para a Brapi foi atingido.")
+        return
     except requests.exceptions.RequestException as e:
-        logging.error(f"ERRO REQUISIÇÃO para {ticker}: {e}")
-    except json.JSONDecodeError:
-        logging.error(f"ERRO JSON para {ticker}. Resposta: {response.text[:100]}...")
+        logging.error(f"ERRO HTTP: Falha na requisição para a Brapi: {e}")
+        return
     except Exception as e:
-        logging.error(f"ERRO INESPERADO ao buscar dados para {ticker}: {e}")
-            
-    return pd.DataFrame()
-
-
-@app.function_name(name="timer_trigger")
-# Agenda: A função será executada diariamente ao meio-dia (12:00:00) UTC
-# Se precisar de outra frequência, ajuste o cron:
-# Ex: "0 */30 * * * *" para a cada 30 minutos
-@app.schedule(schedule="0 0 12 * * *", arg_name="myTimer", run_on_startup=False) 
-def timer_trigger(myTimer: func.TimerRequest) -> None:
-    """Função disparada por tempo para executar a análise de MMS e SQL."""
-    
-    # Verifica se as dependências críticas estão disponíveis
-    if not CONNECTION_STRING or not BRAPI_TOKEN:
-        logging.error("ERRO CRÍTICO: AZURE_SQL_CONNECTION_STRING ou BRAPI_TOKEN não estão configurados nas variáveis de ambiente.")
+        logging.error(f"ERRO GERAL na coleta de dados: {e}")
         return
 
-    start_time = datetime.now()
-    
-    if myTimer.past_due:
-        logging.warning('O timer estava atrasado.')
+    # --------------------------------------------------------------------------
+    # 3. Análise, Geração de Alertas e Extração Inicial de Preços
+    # --------------------------------------------------------------------------
 
-    logging.info(f'Iniciando análise de {len(TICKERS)} ativos. Período MMS: {SMA_PERIOD} velas de {FREQUENCY_MINUTES}m.')
+    registros_para_sql = []
+    primeiros_precos = [] # Nova lista para armazenar o preço e MMS mais recentes
     
-    alerts_generated = 0
-
-    # 1. Loop através de cada ticker
-    for ticker in TICKERS:
-        df_candles = fetch_data_from_brapi(ticker, BRAPI_TOKEN)
+    for df in todos_os_dataframes:
+        if df.empty:
+            continue
         
-        if not df_candles.empty:
-            
-            # 2. Calcular MMS e Alertas
-            alert_type, alert_data = calculate_mms_and_alerts(df_candles, ticker, period=SMA_PERIOD)
-            
-            # 3. Inserir Alerta no SQL
-            if alert_data:
-                # Passa a string de conexão para a função de inserção
-                if insert_alert_into_sql(alert_data, CONNECTION_STRING):
-                    alerts_generated += 1
-                
-        else:
-            logging.info(f"Ignorando {ticker} devido à falha ou ausência de dados.")
+        ticker = df.iloc[0]['Ticker']
+        
+        # 3.1. Cálculo da Média Móvel Simples (MMS)
+        df['MMS_Valor'] = df['Close'].rolling(window=PERIODO_MMS).mean()
+        
+        # Remove as linhas iniciais com valor NaN no MMS
+        df.dropna(subset=['MMS_Valor'], inplace=True)
 
-    end_time = datetime.now()
-    duration = (end_time - start_time).total_seconds()
-    
-    logging.info(f'--- EXECUÇÃO CONCLUÍDA ---')
-    logging.info(f'Total de alertas gerados: {alerts_generated}')
-    logging.info(f'Duração total: {duration:.2f} segundos')
-    
-    if alerts_generated > 0:
-        logging.info("SUCESSO: A execução gerou e tentou inserir alertas.")
+        # ----------------------------------------------------------------------
+        # EXTRAÇÃO DOS 2 PREÇOS MAIS RECENTES (Último Preço e Última MMS)
+        # ----------------------------------------------------------------------
+        if not df.empty:
+            ultima_linha = df.iloc[-1]
+            preco_fechamento_atual = ultima_linha['Close']
+            mms_valor_atual = ultima_linha['MMS_Valor']
+            
+            primeiros_precos.append((
+                ticker, 
+                f"R${preco_fechamento_atual:.2f}", 
+                f"R${mms_valor_atual:.2f}"
+            ))
+
+        # 3.2. Verificação de Cruzamento (Alerta)
+        
+        # Necessita de pelo menos 2 pontos para verificar o cruzamento
+        if len(df) < 2:
+            logging.warning(f"AVISO: {ticker} possui dados insuficientes após o cálculo da MMS para verificar o cruzamento.")
+            continue
+
+        # Ação padrão: Aguardar
+        df['Alerta_Acao'] = 'Aguardar'
+        
+        # Verifica se o preço fechou abaixo da MMS no ponto anterior (penúltima linha)
+        precos_anteriores = df['Close'].shift(1)
+        mms_anteriores = df['MMS_Valor'].shift(1)
+        
+        # Verifica o sinal de cruzamento de compra (Preço anterior abaixo da MMS, Preço atual acima ou igual)
+        condicao_compra = (precos_anteriores < mms_anteriores) & (df['Close'] >= df['MMS_Valor'])
+        df.loc[condicao_compra, 'Alerta_Acao'] = 'COMPRAR'
+
+        # Verifica o sinal de cruzamento de venda (Preço anterior acima da MMS, Preço atual abaixo)
+        condicao_venda = (precos_anteriores >= mms_anteriores) & (df['Close'] < df['MMS_Valor'])
+        df.loc[condicao_venda, 'Alerta_Acao'] = 'VENDER'
+
+        # 3.3. Preparação dos Registros
+        # Filtra apenas os registros que geraram alerta (COMPRAR ou VENDER)
+        df_alertas = df[df['Alerta_Acao'].isin(['COMPRAR', 'VENDER'])].copy()
+        
+        if not df_alertas.empty:
+            logging.info(f"ALERTA(S) GERADO(S) para {ticker}: {df_alertas['Alerta_Acao'].tolist()}")
+            
+            # Formata os registros para a inserção no SQL
+            registros = df_alertas.apply(
+                lambda row: (
+                    row['datetime'].strftime('%Y-%m-%d %H:%M:%S'), # Formata o datetime para SQL
+                    ticker,
+                    row['Close'],
+                    row['MMS_Valor'],
+                    row['Alerta_Acao'],
+                    'Cruzamento MMS'
+                ),
+                axis=1
+            ).tolist()
+            registros_para_sql.extend(registros)
+
+    # --------------------------------------------------------------------------
+    # 4. Sumário dos Preços Iniciais (Os 2 Preços)
+    # --------------------------------------------------------------------------
+    if primeiros_precos:
+        log_msg = ["ÚLTIMOS PREÇOS E MMS (2 Preços por Ticker):"]
+        for ticker, preco, mms in primeiros_precos:
+            log_msg.append(f"  - {ticker}: Preço = {preco}, MMS({PERIODO_MMS}) = {mms}")
+        
+        logging.info("\n".join(log_msg))
     else:
-        logging.info("Nenhum alerta gerado ou inserido nesta execução.")
+        logging.warning("AVISO: Nenhum preço inicial de fechamento/MMS foi extraído.")
+        
+    # --------------------------------------------------------------------------
+    # 5. Persistência dos Dados (Abastecendo a Base)
+    # --------------------------------------------------------------------------
+    
+    if registros_para_sql and SQL_CONNECTION_STRING:
+        try:
+            cnxn = pyodbc.connect(SQL_CONNECTION_STRING)
+            cursor = cnxn.cursor()
+            
+            # Tabela de Alertas (Você pode ajustar o nome da tabela)
+            TABLE_NAME = 'Alertas'
+            
+            for registro in registros_para_sql:
+                # O comando SQL deve refletir a estrutura da sua tabela Alertas
+                sql_insert = f"""
+                INSERT INTO {TABLE_NAME} 
+                (datetime, Ticker, Preco_Fechamento, MMS_Valor, Alerta_Acao, Estrategia) 
+                VALUES (?, ?, ?, ?, ?, ?)
+                """
+                cursor.execute(sql_insert, *registro)
+            
+            cnxn.commit()
+            logging.info(f"SUCESSO: {len(registros_para_sql)} alerta(s) inserido(s) no Banco de Dados SQL.")
+            
+        except pyodbc.Error as ex:
+            sqlstate = ex.args[0]
+            logging.error(f"ERRO PYODBC: Falha na inserção no SQL: {sqlstate}. Verifique a string de conexão ou permissões.")
+        
+        finally:
+            if 'cnxn' in locals() and cnxn:
+                cnxn.close()
+                logging.info("Conexão SQL fechada.")
+    
+    elif not SQL_CONNECTION_STRING:
+        logging.warning("AVISO: String de Conexão SQL não fornecida. Alertas não foram persistidos no Banco de Dados.")
+    
+    else:
+        logging.info("INFO: Nenhum alerta de COMPRA/VENDA gerado para inserção no SQL.")
+
+    logging.info("Execução da Análise de Cruzamento de MMS concluída.")
