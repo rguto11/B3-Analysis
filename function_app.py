@@ -1,306 +1,156 @@
-import logging
-import azure.functions as func
 import os
 import requests
 import json
 import pandas as pd
-import pyodbc 
 from datetime import datetime
-import time 
+from azure.storage.blob import BlobServiceClient
+import logging
+from pytz import timezone
 
-# Inicialização da Function App
-app = func.FunctionApp()
+# Configuração do Logger
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# --- VARIÁVEIS DE CONFIGURAÇÃO ---
-# Lista de tickers para análise
-TICKERS = ["PETR4", "VALE3", "ITUB4", "BBDC4"] 
-FREQUENCY_MINUTES = 30 # Intervalo da vela para o cálculo
-SMA_PERIOD = 14 # Período da Média Móvel Simples (MMS)
-MAX_RETRIES = 3 # Número máximo de tentativas de chamada à API
+# --- CONFIGURAÇÕES DE VARIÁVEIS DE AMBIENTE ---
+AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+BRAPI_TOKEN = os.getenv("BRAPI_TOKEN")
+TICKERS = ['PETR4', 'MGLU3', 'VALE3', 'ITUB4']
+INTERVALO = '30m'
+DIAS = 5
+BLOB_CONTAINER_NAME = "alerts"
+ROLLING_AVERAGE_PERIOD = 20 # Período para o cálculo da MMS (Média Móvel Simples)
 
-# --- CONEXÃO SQL E TOKEN DE API ---
-# A string de conexão é carregada das variáveis de ambiente do Azure
-CONNECTION_STRING = os.environ.get('AZURE_SQL_CONNECTION_STRING')
-# O token Brapi deve ser configurado nas variáveis de ambiente.
-BRAPI_TOKEN = os.environ.get("BRAPI_TOKEN").strip() if os.environ.get("BRAPI_TOKEN") else None
+# --- FUNÇÕES CORE ---
 
-
-def calculate_mms_and_alerts(df: pd.DataFrame, ticker: str, period: int) -> tuple:
-    """
-    Calcula a Média Móvel Simples (MMS) e gera um alerta se o preço atual
-    cruzar a MMS.
-    """
-
-    # 1. Tratamento de dados: Garantir que 'close' é numérico
-    df['close'] = pd.to_numeric(df['close'], errors='coerce')
+def fetch_brapi_data(ticker: str) -> dict:
+    """Busca dados históricos de cotação para um único ticker na API Brapi."""
+    logger.info(f"Iniciando coleta para: {ticker}")
+    url = f"https://brapi.dev/api/quote/{ticker}"
     
-    # Garantir que há dados suficientes para o cálculo do período da MMS
-    # Usamos dropna para contar apenas velas com preço válido
-    df_valid = df.dropna(subset=['close'])
-    if len(df_valid) < period:
-        logging.warning(f"AVISO: Dados insuficientes para {ticker}. Requer {period} pontos, mas encontrou {len(df_valid)}.")
-        return None, None
-
-    # 2. Cálculo da MMS (no DataFrame com todos os dados, NaN incluídos)
-    df['MMS'] = df['close'].rolling(window=period).mean()
-
-    # Filtra apenas linhas onde tanto o preço quanto a MMS são válidos.
-    df_analyzable = df.dropna(subset=['close', 'MMS'])
-    
-    # Precisamos de pelo menos dois pontos válidos (atual e anterior) para detectar o cruzamento.
-    if len(df_analyzable) < 2:
-        logging.info(f"Dados insuficientes para análise de cruzamento de MMS para {ticker}.")
-        return None, None
-
-    # 3. Extração dos pontos atuais e anteriores a partir do DF filtrado
-    last_row = df_analyzable.iloc[-1]
-    prev_row = df_analyzable.iloc[-2]
-    
-    current_price = last_row['close']
-    last_mms = last_row['MMS']
-    
-    prev_price = prev_row['close']
-    prev_mms = prev_row['MMS']
-    
-    alert_type = None
-    
-    # 4. Verificação de Alerta (Cruzamento)
-    if prev_price < prev_mms and current_price > last_mms:
-        alert_type = "COMPRA" # Cruzamento para cima (Preço rompe MMS)
-    elif prev_price > prev_mms and current_price < last_mms:
-        alert_type = "VENDA" # Cruzamento para baixo (Preço rompe MMS)
-    
-    if alert_type:
-        # Retorna o dicionário de dados que será usado na inserção SQL
-        return alert_type, {
-            "ticker": ticker,
-            "price": float(current_price),
-            "mms": float(last_mms),
-            "timestamp": datetime.now().isoformat(),
-            "alert_type": alert_type
-        }
-
-    return None, None
-
-
-def insert_alert_into_sql(alert_data: dict, connection_string: str) -> bool:
-    """
-    Insere o alerta gerado no Banco de Dados SQL do Azure. 
-    Ajustado para o schema de 6 colunas.
-    """
-    
-    if not connection_string:
-        logging.error("ERRO SQL: String de conexão AZURE_SQL_CONNECTION_STRING não encontrada.")
-        return False
-        
-    TABLE_NAME = 'Alertas' 
-    
-    insert_query = f"""
-    INSERT INTO {TABLE_NAME} (datetime, Ticker, Preco_Fechamento, MMS_Valor, Alerta_Acao, Estrategia)
-    VALUES (?, ?, ?, ?, ?, ?);
-    """
-    
-    insert_values = (
-        alert_data['timestamp'], 
-        alert_data['ticker'],    
-        alert_data['price'],     
-        alert_data['mms'],       
-        alert_data['alert_type'],
-        'MMS-14'                 
-    )
-    
-    conn = None
-    try:
-        # Adiciona o driver explícito, pois a string de conexão do Azure pode ser incompleta
-        # Tentamos usar o driver instalado via PRE_BUILD_COMMAND
-        full_conn_string = f"DRIVER={{ODBC Driver 17 for SQL Server}};{connection_string}"
-        conn = pyodbc.connect(full_conn_string)
-        cursor = conn.cursor()
-        
-        cursor.execute(insert_query, insert_values) # O pyodbc espera uma tupla de valores
-        
-        conn.commit()
-        logging.info(f"SUCESSO: Alerta {alert_data['alert_type']} para {alert_data['ticker']} inserido no SQL.")
-        return True
-        
-    except pyodbc.Error as e:
-        sql_error = f"SQLSTATE: {e.args[0]} | MSG: {e.args[1]}"
-        logging.error(f"ERRO SQL CRÍTICO: Falha ao inserir alerta no banco de dados. Detalhe: {sql_error}")
-        logging.error("DICA SQL: Verifique se a tabela 'Alertas' e as colunas (datetime, Ticker, etc.) existem e correspondem no Azure SQL.")
-        # Se for erro de Driver não encontrado, adicionamos um log claro
-        if 'Driver not found' in str(e):
-             logging.error("ERRO CRÍTICO: O Driver ODBC não foi encontrado. A instalação do pyodbc falhou no Azure.")
-        return False
-        
-    except Exception as e:
-        logging.error(f"ERRO INESPERADO ao inserir alerta: {e}")
-        return False
-        
-    finally:
-        if conn:
-            conn.close()
-
-def fetch_data_from_brapi(ticker: str, token: str) -> pd.DataFrame:
-    """Busca dados de velas do ticker na API Brapi (V2) com retentativas e tratamento de erro HTML."""
-    
-    if not token:
-        logging.error("ERRO BRAAPI: Token de acesso não fornecido ou vazio.")
-        return pd.DataFrame()
-
-    interval = "30m"
-    limit = 20 # 20 velas para o cálculo da MMS de 14 períodos
-    # Endpoint V2 para velas (necessário para o intervalo de 30m)
-    url = f"https://brapi.dev/api/v2/finance/candles/{ticker}" 
-    
+    # Parâmetros da API: CRÍTICO usar historical=True para pegar o OHLCV
     params = {
-        'interval': interval,
-        'limit': limit,
-        'token': token
+        'token': BRAPI_TOKEN,
+        'interval': INTERVALO,
+        'range': f'{DIAS}d',
+        'historical': True
     }
     
-    response = None
-    
-    for attempt in range(MAX_RETRIES):
-        logging.info(f"Buscando dados (V2 Candles) para {ticker} (Tentativa {attempt + 1}/{MAX_RETRIES})...")
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status() # Lança exceção para códigos de erro HTTP
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Erro na requisição Brapi para {ticker}: {e}")
+        return {}
+
+def save_to_blob_storage(data: str, blob_name: str):
+    """Salva a string de dados como um blob no Azure Blob Storage."""
+    if not AZURE_STORAGE_CONNECTION_STRING:
+        logger.error("AZURE_STORAGE_CONNECTION_STRING não configurada.")
+        return
         
-        try:
-            response = requests.get(url, params=params, timeout=15)
-            
-            status_code = response.status_code if response is not None else 'N/A'
-            logging.info(f"Resposta HTTP para {ticker}: Status {status_code}")
-            
-            # Checagem de Erros de Status Específicos para diagnóstico de 404/Token
-            if status_code in (404, 401, 403, 429):
-                # Usamos um log de erro CLARO para identificar o problema
-                if status_code == 404:
-                    logging.error(f"ERRO CRÍTICO 404 (Não Encontrado) para {ticker}. Causa: Ticker inválido ou URL '{url}' da Brapi mudou.")
-                elif status_code in (401, 403):
-                    logging.error(f"ERRO CRÍTICO {status_code} (Token Inválido). Causa: O 'BRAPI_TOKEN' no Azure está incorreto ou expirou.")
-                elif status_code == 429:
-                    logging.error(f"ERRO CRÍTICO 429 (Limite de Taxa Excedido). Causa: O token gratuito está no Rate Limit. Tente novamente em 1 hora.")
-                
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)
-                    continue # Vai para a próxima tentativa
-                else:
-                    response.raise_for_status() # Força a exceção na última tentativa
-            
-            # Se não for um erro crítico conhecido, forçamos o raise para capturar outros 4xx/5xx
-            response.raise_for_status() 
-
-            # ---------------------------------------------------------------------
-            # NOVO: TRATAMENTO PARA RESPOSTA HTML COM STATUS 200 (CAUSA DO SEU ERRO)
-            # ---------------------------------------------------------------------
-            content_type = response.headers.get('Content-Type', '').lower()
-            
-            # Verifica se o Status é 200 (OK), mas o conteúdo é HTML (página de aviso/limite)
-            if 'application/json' not in content_type and response.text.strip().startswith('<!DOCTYPE html>'):
-                error_response_text = response.text[:300].replace('\n', ' ')
-                logging.error(f"ERRO DE CONTEÚDO para {ticker}: Status 200, mas **HTML recebido** (Não JSON). Causa provável: **Token inválido ou Rate Limit**. Conteúdo (Início): {error_response_text}...")
-                
-                # Força a falha da tentativa para que a lógica de retry seja acionada
-                if attempt < MAX_RETRIES - 1:
-                    wait_time = 2 ** attempt
-                    logging.info(f"Falha na tentativa {attempt + 1}. Tentando novamente em {wait_time} segundos...")
-                    time.sleep(wait_time)
-                    continue 
-                else:
-                    # Se for a última tentativa, o json.JSONDecodeError ocorrerá abaixo, mas o log
-                    # do erro real já foi feito acima.
-                    pass
-
-            # ---------------------------------------------------------------------
-            
-            # Tenta decodificar o JSON
-            data = response.json()
-            
-            if data.get('candles'):
-                df = pd.DataFrame(data['candles'])
-                df['datetime'] = pd.to_datetime(df['timestamp'], unit='s')
-                df.set_index('datetime', inplace=True)
-                logging.info(f"SUCESSO BRAAPI: {len(df)} velas carregadas para {ticker}.")
-                return df
-            else:
-                logging.warning(f"AVISO BRAAPI: Dados de candles ausentes para {ticker}. Resposta da API: {data}")
-                return pd.DataFrame()
-                
-        except json.JSONDecodeError as e:
-            # Este bloco agora pega o erro caso o HTML (ou outro conteúdo não-JSON) não tenha sido pego acima
-            error_response_text = response.text[:300].replace('\n', ' ') if response is not None else "Sem resposta"
-            logging.error(f"ERRO JSON DECODIFICAÇÃO para {ticker}: Falha ao decodificar a resposta. {e}. Conteúdo (Início): {error_response_text}...")
-                
-        except requests.exceptions.HTTPError as errh:
-            status_code = response.status_code if response is not None else 'N/A'
-            logging.error(f"ERRO HTTP (Tentativa {attempt+1}/{MAX_RETRIES}) para {ticker}: Código {status_code} - {errh}.")
-            
-        except requests.exceptions.RequestException as err:
-            logging.error(f"ERRO DE REQUISIÇÃO GENÉRICO (Tentativa {attempt+1}/{MAX_RETRIES}) para {ticker}: {err}")
-        except Exception as e:
-            logging.error(f"ERRO INESPERADO (Tentativa {attempt+1}/{MAX_RETRIES}) ao buscar dados para {ticker}: {e}")
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+        blob_client = blob_service_client.get_blob_client(
+            container=BLOB_CONTAINER_NAME, 
+            blob=blob_name
+        )
         
-        # Se falhou, mas não foi a última tentativa, espera e tenta novamente
-        if attempt < MAX_RETRIES - 1:
-            wait_time = 2 ** attempt 
-            logging.info(f"Falha na tentativa {attempt + 1}. Tentando novamente em {wait_time} segundos...")
-            time.sleep(wait_time)
+        blob_client.upload_blob(data, overwrite=True)
+        logger.info(f"✅ Arquivo salvo no Blob Storage: {blob_name}")
+    except Exception as e:
+        logger.error(f"Erro ao salvar no Blob Storage: {e}")
 
-
-    # Se todas as tentativas falharem
-    logging.error(f"FALHA PERMANENTE: Não foi possível obter dados da Brapi para {ticker} após {MAX_RETRIES} tentativas.")
-    return pd.DataFrame()
-
-
-@app.function_name(name="timer_trigger")
-# CRON alterado para rodar a cada 5 minutos para facilitar o debugging
-@app.schedule(schedule="0 0 * * * *", arg_name="myTimer", run_on_startup=False) 
-def timer_trigger(myTimer: func.TimerRequest) -> None:
-    """Função disparada por tempo para executar a análise de MMS e SQL."""
+def run_analysis():
+    """Função principal: coleta, processa, calcula MMS e salva no Blob Storage."""
     
-    # 0. Checagem de ambiente
-    if not CONNECTION_STRING:
-        logging.critical("ERRO FATAL: AZURE_SQL_CONNECTION_STRING não está configurada.")
+    if not all([BRAPI_TOKEN, AZURE_STORAGE_CONNECTION_STRING]):
+        logger.error("Variáveis de ambiente BRAPI_TOKEN ou AZURE_STORAGE_CONNECTION_STRING não estão definidas.")
         return
 
-    if not BRAPI_TOKEN:
-        logging.critical("ERRO FATAL: BRAPI_TOKEN não está configurada.")
-        return
-
-    start_time = datetime.now()
+    all_data = []
     
-    if myTimer.past_due:
-        logging.warning('O timer estava atrasado.')
-
-    logging.info(f'Iniciando análise de {len(TICKERS)} ativos. Período MMS: {SMA_PERIOD} velas de {FREQUENCY_MINUTES}m.')
-    
-    alerts_generated = 0
-
-    # 1. Loop através de cada ticker
+    # 2. Coleta de Dados Históricos
     for ticker in TICKERS:
-        df_candles = fetch_data_from_brapi(ticker, BRAPI_TOKEN)
+        data = fetch_brapi_data(ticker)
         
-        if not df_candles.empty:
+        # O foco é no 'historicalData', ignorando os dados de cotação atual (que não têm OHLCV por 30m)
+        if data and data.get('historicalData'):
+            df = pd.DataFrame(data['historicalData'])
             
-            # 2. Calcular MMS e Alertas
-            alert_type, alert_data = calculate_mms_and_alerts(df_candles, ticker, period=SMA_PERIOD)
+            # Adiciona o ticker
+            df['ticker'] = ticker
             
-            # 3. Inserir Alerta no SQL
-            if alert_data:
-                if insert_alert_into_sql(alert_data, CONNECTION_STRING):
-                    alerts_generated += 1
-            else:
-                logging.info(f"Nenhum cruzamento de MMS (Alerta) detectado para {ticker}.")
-                
+            # --- CRÍTICO: CONVERSÃO DE TIMESTAMP PARA DATETIME ---
+            df['datetime'] = pd.to_datetime(df['date'], unit='s').dt.tz_localize(None) 
+            
+            # Renomeia colunas para o esquema que queremos
+            df = df.rename(columns={'open': 'open', 'high': 'high', 'low': 'low', 'close': 'close', 'volume': 'volume'})
+            
+            # Filtra apenas as colunas que serão usadas no cálculo
+            df = df[['ticker', 'datetime', 'open', 'high', 'low', 'close', 'volume']]
+            
+            all_data.append(df)
         else:
-            logging.info(f"Ignorando {ticker} devido à falha ou ausência de dados.")
+            logger.warning(f"Dados históricos vazios ou ausentes para {ticker}")
 
-    end_time = datetime.now()
-    duration = (end_time - start_time).total_seconds()
+    if not all_data:
+        logger.error("Nenhum dado histórico coletado. Finalizando a execução.")
+        return
+
+    # 3. Consolidação e Preparação do DataFrame
+    df_master = pd.concat(all_data, ignore_index=True).dropna(subset=['close'])
+
+    # --- LÓGICA DE ALERTA (MMS E STATUS) ---
     
-    logging.info(f'--- EXECUÇÃO CONCLUÍDA ---')
-    logging.info(f'Total de alertas gerados: {alerts_generated}')
-    logging.info(f'Duração total: {duration:.2f} segundos')
+    def calculate_alerts(group):
+        """Calcula a MMS e gera o status de alerta (BUY/SELL) para um grupo (ticker)."""
+        group = group.sort_values(by='datetime')
+        
+        # 1. Cálculo da Média Móvel Simples (MMS)
+        group['mms'] = group['close'].rolling(window=ROLLING_AVERAGE_PERIOD, min_periods=1).mean()
+        
+        # 2. Geração do Status de Alerta
+        group['status'] = 'HOLD'
+        
+        # Sinal de Compra (BUY)
+        buy_condition = (group['close'] > group['mms']) & (group['close'].shift(1) <= group['mms'].shift(1))
+        group.loc[buy_condition, 'status'] = 'BUY'
+        
+        # Sinal de Venda (SELL)
+        sell_condition = (group['close'] < group['mms']) & (group['close'].shift(1) >= group['mms'].shift(1))
+        group.loc[sell_condition, 'status'] = 'SELL'
+        
+        # Se for a última cotação e não houver BUY/SELL, mantém como NEUTRO (melhor que HOLD)
+        if group['status'].iloc[-1] not in ['BUY', 'SELL']:
+            group.loc[group.index[-1], 'status'] = 'NEUTRO'
+            
+        return group
     
-    if alerts_generated > 0:
-        logging.info(f"SUCESSO: {alerts_generated} alerta(s) inserido(s) no Banco de Dados SQL.")
-    else:
-        logging.info("Nenhum alerta gerado ou inserido nesta execução.")
+    # Aplica a função de alerta para cada ticker separadamente
+    df_master = df_master.groupby('ticker').apply(calculate_alerts, include_groups=False).reset_index(drop=True)
+    
+    # 4. Formato de Saída (Filtro Final CRÍTICO)
+    
+    # Define as colunas finais na ORDEM correta
+    colunas_finais = ['ticker', 'datetime', 'open', 'high', 'low', 'close', 'volume', 'mms', 'status']
+    df_final = df_master[colunas_finais]
+    
+    # Nome do arquivo CSV
+    sao_paulo_tz = timezone('America/Sao_Paulo')
+    current_time_sp = datetime.now(sao_paulo_tz)
+    timestamp_str = current_time_sp.strftime("%Y-%m-%d_%H-%M-%S")
+    csv_blob_name = f"analise_b3_{timestamp_str}.csv"
+    
+    # Salva o DataFrame final no Blob Storage
+    csv_data = df_final.to_csv(index=False)
+    save_to_blob_storage(csv_data, csv_blob_name)
+    
+    logger.info(f"✅ Análise concluída. Total de registros processados: {len(df_final)}")
+
+
+# --- PONTO DE ENTRADA DO CONTAINER APP JOB ---
+if __name__ == "__main__":
+    logger.info("Iniciando a execução do Container App Job.")
+    run_analysis()
+    logger.info("Execução do Container App Job finalizada.")

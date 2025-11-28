@@ -1,4 +1,4 @@
-pandas
 requests
-pyodbc
-azure-functions
+pandas
+azure-storage-blob
+pytz
